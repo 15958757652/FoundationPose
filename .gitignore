@@ -1,0 +1,15 @@
+weights/
+*.pth
+*.pt
+*.ckpt
+*.bin
+__pycache__/
+*.pyc
+.DS_Store
+*.so
+build/
+dist/
+*.egg-info/
+demo_data/
+*.deb
+wget-log

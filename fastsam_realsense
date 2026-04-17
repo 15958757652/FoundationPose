@@ -1,0 +1,136 @@
+import pyrealsense2 as rs
+import numpy as np
+import cv2
+from fastsam import FastSAM, FastSAMPrompt
+
+model_path = "weights/FastSAM-s.pt"
+device = "cpu"
+
+print("Loading model...")
+model = FastSAM(model_path)
+print("FastSAM model loaded.")
+
+pipeline = rs.pipeline()
+config = rs.config()
+config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+
+print("Starting RealSense...")
+profile = pipeline.start(config)
+print("RealSense started.")
+
+# 对齐深度到彩色
+align_to = rs.stream.color
+align = rs.align(align_to)
+
+# 获取相机内参和深度比例
+color_stream = profile.get_stream(rs.stream.color)
+intr = color_stream.as_video_stream_profile().get_intrinsics()
+K = np.array([[intr.fx, 0, intr.ppx],
+              [0, intr.fy, intr.ppy],
+              [0,      0,      1 ]], dtype=np.float32)
+
+depth_sensor = profile.get_device().first_depth_sensor()
+depth_scale = depth_sensor.get_depth_scale()
+print("depth_scale:", depth_scale)
+
+save_dir = "/home/zddd/tmp"
+os.makedirs(save_dir, exist_ok=True)
+
+current_masks = None
+selected_mask_index = -1
+
+win_all = "FastSAM - All masks (green) + selected (red)"
+win_only = "FastSAM - Only selected contour (red)"
+
+def mouse_callback(event, x, y, flags, param):
+    global selected_mask_index, current_masks
+    if event == cv2.EVENT_LBUTTONDOWN:
+        if current_masks is None or len(current_masks) == 0:
+            print("No masks available yet.")
+            return
+
+        img = param  # 当前帧原图
+        h, w = img.shape[:2]
+
+        if not (0 <= x < w and 0 <= y < h):
+            print(f"Click ({x}, {y}) out of image bounds.")
+            return
+
+        found = False
+        for i, m in enumerate(current_masks):
+            m_np = m.cpu().numpy()
+            if m_np.shape[0] != h or m_np.shape[1] != w:
+                continue
+            if m_np[y, x] == 1:
+                selected_mask_index = i
+                found = True
+                print(f"Selected mask index: {i} at point ({x}, {y})")
+                break
+
+        if not found:
+            selected_mask_index = -1
+            print(f"Clicked at ({x}, {y}), no mask found, selection cleared.")
+
+cv2.namedWindow(win_all)
+cv2.namedWindow(win_only)
+
+try:
+    while True:
+        frames = pipeline.wait_for_frames()
+        frames = align.process(frames)
+
+        color_frame = frames.get_color_frame()
+        depth_frame = frames.get_depth_frame()
+        if not color_frame or not depth_frame:
+            continue
+
+        img = np.asanyarray(color_frame.get_data())           # H,W,3 BGR
+        depth_raw = np.asanyarray(depth_frame.get_data())     # uint16
+        depth = depth_raw.astype(np.float32) * depth_scale    # 转为米，H,W
+
+        # 绑定当前图像给鼠标回调
+        cv2.setMouseCallback(win_all, mouse_callback, param=img)
+
+        # FastSAM 推理
+        results = model(img, device=device, retina_masks=True)
+        prompt = FastSAMPrompt(img, results, device=device)
+        masks = prompt.everything_prompt()
+        current_masks = masks
+
+        # 显示所有 mask（绿色）+ 选中 mask（红轮廓）
+        result_img = img.copy()
+        overlay = result_img.copy()
+        for m in masks:
+            m_np = m.cpu().numpy().astype(bool)
+            overlay[m_np] = (0, 255, 0)  # green
+
+        alpha = 0.4
+        result_img = cv2.addWeighted(overlay, alpha, result_img, 1 - alpha, 0)
+
+        if 0 <= selected_mask_index < len(masks):
+            sel = masks[selected_mask_index].cpu().numpy().astype(np.uint8) * 255
+            contours, _ = cv2.findContours(sel, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(result_img, contours, -1, (0, 0, 255), 2)
+
+        cv2.imshow(win_all, result_img)
+
+        # 窗口二：原图，顺便在这里保存数据（只保存一次）
+        only_red_img = img.copy()
+        if 0 <= selected_mask_index < len(masks):
+            m = masks[selected_mask_index].cpu().numpy().astype(np.uint8)  # 0/1
+            np.save(os.path.join(save_dir, "rgb.npy"), img)      # BGR
+            np.save(os.path.join(save_dir, "depth.npy"), depth)  # float32, meter
+            np.save(os.path.join(save_dir, "mask.npy"), m)       # 0/1
+            np.save(os.path.join(save_dir, "K.npy"), K)
+            print("Saved rgb.npy, depth.npy, mask.npy, K.npy for FoundationPose.")
+
+        cv2.imshow(win_only, only_red_img)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
+
+finally:
+    pipeline.stop()
+    cv2.destroyAllWindows()
