@@ -1,0 +1,13 @@
+name: robo_env
+channels:
+  - defaults
+dependencies:
+  - python=3.8
+  - pytorch-cuda=11.8
+  - pytorch=2.0.1
+  - torchaudio
+  - torchvision
+  - pytorch3d=0.7.7=py38_cu118_pyt201
+  - cmake
+  - ninja
+prefix: /home/zddd/miniconda3/envs/robo_env
